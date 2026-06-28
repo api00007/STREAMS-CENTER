@@ -76,6 +76,7 @@ def extract_stream_token(scraper, player_url):
     try:
         # Step 1: Fetch the parent embed page (e.g., ch1.php)
         res = scraper.get(player_url, timeout=10)
+        res.encoding = 'utf-8'  # Ensure proper UTF-8 decoding [cite: 2.1]
         html = res.text
         
         # Search for any stream parameter directly in the HTML or inside iframe src
@@ -94,6 +95,7 @@ def extract_stream_token(scraper, player_url):
             
             time.sleep(random.uniform(0.3, 0.6))
             iframe_res = scraper.get(iframe_url, timeout=10)
+            iframe_res.encoding = 'utf-8'  # Force UTF-8 encoding [cite: 2.1]
             iframe_html = iframe_res.text
             
             inner_stream_ids = re.findall(r'stream=([a-zA-Z0-9_.-]+)', iframe_html)
@@ -113,7 +115,7 @@ def run_scraper():
             ("Status", "Failed"),
             ("Error", "BASE_URL environment variable is missing. Please add BASE_URL to GitHub Secrets.")
         ])
-        print(json.dumps(error_package, indent=4))
+        print(json.dumps(error_package, indent=4, ensure_ascii=False))
         return
 
     # Use backend API URL
@@ -125,6 +127,7 @@ def run_scraper():
     log_to_console(f"[*] Loading homepage: {BASE_URL}")
     try:
         res = scraper.get(f"{BASE_URL}", timeout=15)
+        res.encoding = 'utf-8'  # Force UTF-8 on homepage fetch [cite: 2.1]
         homepage_html = res.text
         log_to_console("[+] Homepage loaded successfully.")
     except Exception as e:
@@ -135,7 +138,7 @@ def run_scraper():
             ("Error", "Could not connect to the website. Possibly blocked by Cloudflare or network timeout."),
             ("Details", str(e))
         ])
-        print(json.dumps(error_package, indent=4))
+        print(json.dumps(error_package, indent=4, ensure_ascii=False))
         return
 
     # Fetching Categories Map directly from API
@@ -143,6 +146,7 @@ def run_scraper():
     log_to_console("[*] Loading categories from API...")
     try:
         cats_res = scraper.get(f"{api_endpoint}/Categories", timeout=10)
+        cats_res.encoding = 'utf-8'  # Force UTF-8
         if cats_res.status_code == 200:
             categories = cats_res.json()
             for cat in categories:
@@ -155,6 +159,7 @@ def run_scraper():
     log_to_console("\n[*] Loading matches from API...")
     try:
         games_res = scraper.get(f"{api_endpoint}/Parties?pageNumber=1&pageSize=500", timeout=15)
+        games_res.encoding = 'utf-8'  # Force UTF-8
         if games_res.status_code != 200:
             log_to_console(f"[ERROR] API failed with status: {games_res.status_code}")
             return
@@ -212,6 +217,7 @@ def run_scraper():
         # 3. Fetch fallback Parties/{id}/Servers endpoint
         try:
             srv_res = scraper.get(f"{api_endpoint}/Parties/{game_id}/Servers", timeout=10)
+            srv_res.encoding = 'utf-8'
             if srv_res.status_code == 200:
                 srv_data = srv_res.json()
                 if isinstance(srv_data, list):
@@ -256,7 +262,7 @@ def run_scraper():
                     all_live_matches.append(OrderedDict([
                         ("Id", str(len(all_live_matches) + 1)),
                         ("Rivels", item["clean_rivals"]),
-                        ("Title", f"{item['cat_name']} (S-{idx})"),
+                        ("Title", f"{item['cat_name']} (S-{s_idx})"),
                         ("Link", final_link)
                     ]))
             else:
@@ -271,15 +277,15 @@ def run_scraper():
         ("Live_Data", all_live_matches)
     ])
     
-    # Save output inside the Action runner locally before pushing
-    with open(OUTPUT_FILE, "w") as f:
-        json.dump(final_package, f, indent=4)
+    # Save output inside the Action runner using explicit UTF-8 encoding
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
+        json.dump(final_package, f, indent=4, ensure_ascii=False)
     
     # Push to target repository
     push_to_github()
     
-    # Print raw formatted JSON output to standard output only
-    print(json.dumps(final_package, indent=4))
+    # Print raw formatted JSON output with raw unicode characters preserved to standard output
+    print(json.dumps(final_package, indent=4, ensure_ascii=False))
 
 if __name__ == "__main__":
     run_scraper()
