@@ -1,2 +1,2 @@
 cloudscraper
-pytz
+beautifulsoup4
