@@ -10,19 +10,10 @@ from collections import OrderedDict
 from urllib.parse import urljoin
 import cloudscraper
 
-BASE_URL = os.getenv("BASE_URL", "https://streamcenter.st").strip()
+API_ORIGIN = "https://streamcenter.st"
 OUTPUT_FILE = "streams-center.json"
 
-DEFAULT_SPORTS = [
-    "american-football",
-    "football",
-    "baseball",
-    "basketball",
-    "hockey",
-    "fighting",
-    "motorsport",
-    "wwe"
-]
+DEFAULT_SPORTS = ["football", "soccer", "basketball", "baseball", "boxing"]
 
 def get_ist_time():
     ist_offset = timezone(timedelta(hours=5, minutes=30))
@@ -35,6 +26,26 @@ def deduplicate(seq):
     seen = set()
     return [x for x in seq if not (x in seen or seen.add(x))]
 
+def safe_json_parse(text):
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        if "][" in text:
+            first_part = text.split("][")[0] + "]"
+            try:
+                return json.loads(first_part)
+            except Exception:
+                pass
+        match = re.search(r'(\[.*\]|\{.*\})', text, re.S)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except Exception:
+                pass
+    return None
+
 def push_to_github():
     GITHUB_TOKEN = os.getenv("GH_TOKEN")
     GITHUB_USER = os.getenv("TGITHUB_USER")
@@ -42,7 +53,7 @@ def push_to_github():
     GITHUB_EMAIL = os.getenv("TGITHUB_EMAIL")
     
     if not GITHUB_TOKEN or not GITHUB_USER or not GITHUB_REPO:
-        log_to_console("[INFO] GitHub secrets missing. Skipping GitHub push.")
+        log_to_console("[INFO] GitHub secrets missing. Skipping push.")
         return
 
     temp_dir = "temp_external_repo"
@@ -78,144 +89,146 @@ def push_to_github():
     except Exception as e:
         log_to_console(f"[ERROR] Push failed: {e}")
 
-def resolve_stream_url(scraper, origin, group):
-    source = group.get("source") or group.get("provider") or "iframe"
-    source_id = group.get("id")
-    if not source_id:
-        return None
+def scan_m3u8_from_html(html_text):
+    stream_tokens = re.findall(r'(?:stream=|hls\.php\?stream=)([a-zA-Z0-9_.-]+)', html_text)
+    for token in stream_tokens:
+        return f"https://edgestream2.pro/hls/{token}.m3u8|Referer=https://streame.center"
+        
+    direct_m3u8 = re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', html_text)
+    for link in direct_m3u8:
+        clean_link = link.replace('\\/', '/').strip('"\';')
+        return f"{clean_link}|Referer=https://streame.center"
+        
+    return None
 
-    api_url = f"{origin}/api/stream/{source}/{source_id}"
+def extract_stream_from_embed(scraper, embed_url):
     try:
-        res = scraper.get(api_url, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if isinstance(data, list) and data:
-                first = data[0]
-                if isinstance(first, dict):
-                    return first.get("url") or first.get("src") or first.get("link")
-                elif isinstance(first, str):
-                    return first
-            elif isinstance(data, dict):
-                return data.get("url") or data.get("src") or data.get("link")
-    except Exception:
-        pass
+        headers = {
+            'Referer': f"{API_ORIGIN}/",
+            'Origin': API_ORIGIN
+        }
+        res = scraper.get(embed_url, headers=headers, timeout=12)
+        res.encoding = 'utf-8'
+        html = res.text
+        
+        link = scan_m3u8_from_html(html)
+        if link:
+            return link
+
+        iframes = re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, re.I)
+        for ifr in iframes:
+            if ifr.startswith('//'):
+                ifr_url = 'https:' + ifr
+            elif not ifr.startswith('http'):
+                ifr_url = urljoin(embed_url, ifr)
+            else:
+                ifr_url = ifr
+
+            time.sleep(random.uniform(0.3, 0.5))
+            ifr_res = scraper.get(ifr_url, headers={'Referer': embed_url}, timeout=10)
+            ifr_res.encoding = 'utf-8'
+            ifr_link = scan_m3u8_from_html(ifr_res.text)
+            if ifr_link:
+                return ifr_link
+    except Exception as e:
+        log_to_console(f"    [!] Error loading embed {embed_url}: {e}")
+        
     return None
 
 def run_scraper():
-    origin = BASE_URL.rstrip('/')
-    if "streame.center" in origin:
-        origin = "https://streamcenter.st"
-    elif not origin.startswith("http"):
-        origin = "https://" + origin
-
     scraper = cloudscraper.create_scraper(browser={'browser': 'chrome', 'platform': 'android', 'desktop': False})
     
-    log_to_console(f"[*] Connecting to catalog API at: {origin}")
-    
+    log_to_console(f"[*] Connecting to: {API_ORIGIN}")
     sports_slugs = []
+
     try:
-        sports_res = scraper.get(f"{origin}/api/sports", timeout=12)
+        sports_res = scraper.get(f"{API_ORIGIN}/api/sports", timeout=12)
         if sports_res.status_code == 200:
-            sports_data = sports_res.json()
-            if isinstance(sports_data, list):
-                for item in sports_data:
-                    if isinstance(item, str):
-                        sports_slugs.append(item)
-                    elif isinstance(item, dict) and "id" in item:
+            parsed = safe_json_parse(sports_res.text)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and "id" in item:
                         sports_slugs.append(item["id"])
-                    elif isinstance(item, dict) and "slug" in item:
-                        sports_slugs.append(item["slug"])
+                    elif isinstance(item, str):
+                        sports_slugs.append(item)
     except Exception as e:
-        log_to_console(f"[!] Sports list API unavailable ({e}), using default sports catalog.")
+        log_to_console(f"[!] Failed to fetch sports catalog: {e}")
 
     if not sports_slugs:
         sports_slugs = DEFAULT_SPORTS
 
     sports_slugs = deduplicate(sports_slugs)
-    log_to_console(f"[+] Sports catalog ready with {len(sports_slugs)} disciplines.")
+    log_to_console(f"[+] Total sports categories: {len(sports_slugs)}")
 
     all_live_matches = []
     seen_match_ids = set()
 
     for sport in sports_slugs:
-        matches_url = f"{origin}/api/matches/{sport}"
+        log_to_console(f"[*] Scanning matches for sport: {sport}")
         try:
-            time.sleep(random.uniform(0.3, 0.6))
-            res = scraper.get(matches_url, timeout=12)
-            if res.status_code != 200:
+            time.sleep(random.uniform(0.4, 0.7))
+            matches_res = scraper.get(f"{API_ORIGIN}/api/matches/{sport}", timeout=12)
+            if matches_res.status_code != 200:
                 continue
 
-            matches = res.json()
-            if not isinstance(matches, list):
+            matches_data = safe_json_parse(matches_res.text)
+            if not isinstance(matches_data, list):
                 continue
 
-            for match in matches:
+            for match in matches_data:
                 match_id = match.get("id")
                 if not match_id or match_id in seen_match_ids:
-                    continue
-
-                status = str(match.get("status", "")).lower()
-                if status in ["ended", "finished", "final"]:
                     continue
 
                 seen_match_ids.add(match_id)
                 raw_title = match.get("title", "")
                 clean_rivals = re.sub(r'\s+@\s+|\s+\|\s+', ' vs ', raw_title).strip()
-                league_name = match.get("leagueName") or match.get("categoryName") or sport.replace("-", " ").title()
+                cat_name = match.get("category", sport).replace("-", " ").title()
 
-                sources = match.get("sources") or []
+                sources = match.get("sources", [])
                 if not sources:
-                    watch_link = f"{origin}/watch/{match_id}"
-                    all_live_matches.append(OrderedDict([
-                        ("Id", str(len(all_live_matches) + 1)),
-                        ("Rivels", clean_rivals),
-                        ("Title", f"{league_name} (S-1)"),
-                        ("Link", watch_link)
-                    ]))
                     continue
 
                 for s_idx, src in enumerate(sources, 1):
-                    time.sleep(random.uniform(0.2, 0.4))
-                    direct_stream = resolve_stream_url(scraper, origin, src)
+                    src_type = src.get("source", "iframe")
+                    src_id = src.get("id")
+                    if not src_id:
+                        continue
 
-                    if direct_stream:
-                        if ".m3u8" in direct_stream:
-                            final_link = f"{direct_stream.split('?')[0].rstrip('/')}|Referer={origin}"
-                        else:
-                            final_link = direct_stream
-                    else:
-                        final_link = f"{origin}/watch/{match_id}"
+                    time.sleep(random.uniform(0.3, 0.6))
+                    stream_api = f"{API_ORIGIN}/api/stream/{src_type}/{src_id}"
+                    
+                    try:
+                        stream_res = scraper.get(stream_api, timeout=10)
+                        if stream_res.status_code != 200:
+                            continue
 
-                    all_live_matches.append(OrderedDict([
-                        ("Id", str(len(all_live_matches) + 1)),
-                        ("Rivels", clean_rivals),
-                        ("Title", f"{league_name} (S-{s_idx})"),
-                        ("Link", final_link)
-                    ]))
+                        streams_info = safe_json_parse(stream_res.text)
+                        if not isinstance(streams_info, list) or not streams_info:
+                            continue
+
+                        for stream_entry in streams_info:
+                            embed_url = stream_entry.get("embedUrl")
+                            stream_num = stream_entry.get("streamNo", s_idx)
+                            
+                            if not embed_url:
+                                continue
+
+                            final_m3u8 = extract_stream_from_embed(scraper, embed_url)
+                            if final_m3u8:
+                                log_to_console(f"    [+] Link Created: {clean_rivals} (S-{stream_num})")
+                                all_live_matches.append(OrderedDict([
+                                    ("Id", str(len(all_live_matches) + 1)),
+                                    ("Rivels", clean_rivals),
+                                    ("Title", f"{cat_name} (S-{stream_num})"),
+                                    ("Link", final_m3u8)
+                                ]))
+                    except Exception:
+                        continue
         except Exception:
             continue
 
-    if not all_live_matches:
-        try:
-            cards_res = scraper.get(f"{origin}/game-cards/embed", timeout=15)
-            next_chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', cards_res.text)
-            for chunk in next_chunks:
-                clean_chunk = chunk.replace('\\"', '"').replace('\\\\', '\\')
-                event_matches = re.findall(r'\{"id":"(event-[^"]+)","title":"([^"]+)".*?"leagueName":"([^"]+)"', clean_chunk)
-                for eid, etitle, eleague in event_matches:
-                    if eid not in seen_match_ids:
-                        seen_match_ids.add(eid)
-                        clean_rivals = re.sub(r'\s+@\s+|\s+\|\s+', ' vs ', etitle).strip()
-                        all_live_matches.append(OrderedDict([
-                            ("Id", str(len(all_live_matches) + 1)),
-                            ("Rivels", clean_rivals),
-                            ("Title", f"{eleague} (S-1)"),
-                            ("Link", f"{origin}/watch/{eid}")
-                        ]))
-        except Exception:
-            pass
-
-    log_to_console(f"[+] Total live streams collected: {len(all_live_matches)}")
+    log_to_console(f"\n[+] Total Live Streams Collected: {len(all_live_matches)}")
 
     final_package = OrderedDict([
         ("Owner", "Ivan-FluX"),
@@ -229,7 +242,6 @@ def run_scraper():
         json.dump(final_package, f, indent=4, ensure_ascii=False)
 
     push_to_github()
-
     print(json.dumps(final_package, indent=4, ensure_ascii=False))
 
 if __name__ == "__main__":
