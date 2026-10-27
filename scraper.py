@@ -92,7 +92,7 @@ def push_to_github():
 def scan_m3u8_from_html(html_text):
     stream_tokens = re.findall(r'(?:stream=|hls\.php\?stream=)([a-zA-Z0-9_.-]+)', html_text)
     for token in stream_tokens:
-        return f"https://edgestream2.pro/hls/{token}.m3u8|Referer=https://streame.center"
+        return f"https://edgestream2.pro/hls/{token}.m3u8|Referer=https://embedcenter.st"
         
     direct_m3u8 = re.findall(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', html_text)
     for link in direct_m3u8:
